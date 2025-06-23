@@ -1,0 +1,410 @@
+```{r Library}
+library(pacman)
+p_load(tidyverse, tidylog, skimr, sp, sf, viridis, spatstat, raster, colorspace, ggnewscale, 
+       spdep, FNN, grid, gridExtra, knitr, kableExtra, tidycensus, lubridate, 
+       ggforce, ggridges, ggsci, ggdist, gtsummary, flextable, officer, stringr, cowplot, snakecase)
+p_load(rcartocolor)
+
+options(scipen = 999)
+theme_set(theme_void())
+#theme_gtsummary_journal(journal = "jama")
+theme_gtsummary_compact()
+set.seed(100)
+
+
+```
+
+```{r Import Overdose Data}
+#Import overdose data
+df.overdose <- read_csv("2012-01-2024-06-ods_repo.csv")
+
+df.overdose <- df.overdose %>%
+  rename(ID = CaseNumber) %>%
+    mutate(`Date of Death` = ymd(`DeathDate`)) %>%
+  mutate(`Date of Death` = if_else(is.na(`Date of Death`), DateofDeath, `Date of Death`))
+
+
+#Data wrangling
+##Recode race
+df.overdose <- df.overdose %>%
+  mutate(
+    Race = case_when(
+      # Map to WHITE
+      Race %in% c("CAUCASIAN", "WHITE", "White/Caucasian", "White/Ca\nucasian") ~ "WHITE",
+      
+      # Map to LATINE
+      Race %in% c("HISPANIC/LATIN AMERICAN", "Hispanic/Latino", "Hispanic/\nLatino") ~ "LATINE",
+      str_detect(Race, "Hispanic") ~ "LATINE", # Catch variations with "Hispanic"
+      
+      # Map to BLACK
+      Race %in% c("BLACK", "Black") ~ "BLACK",
+      
+      # Map to ASIAN
+      Race %in% c("ASIAN", "Asian", "CHINESE", "FILIPINO", "JAPANESE", "KOREAN", "VIETNAMESE", "THAI", "CAMBODIAN") ~ "ASIAN",
+      
+      # Handle compound categories (e.g., mixed races)
+      str_detect(Race, "White.*Hispanic|Hispanic.*White") ~ "LATINE", 
+      str_detect(Race, "White.*Asian|Asian.*White") ~ "ASIAN",
+      str_detect(Race, "Black.*Hispanic|Hispanic.*Black") ~ "LATINE",
+      str_detect(Race, "Black.*Asian|Asian.*Black") ~ "ASIAN",
+      
+      # Unknown or ambiguous categories
+      Race %in% c("UNKNOWN", "Unknown/Other", "Unknown/\nOther", NA) ~ "UNKNOWN",
+      
+      # All other cases
+      TRUE ~ "OTHER"
+    )
+  ) %>%
+  # Ensure consistent capitalization
+  mutate(
+    Race = str_to_upper(Race),
+    Race = factor(Race, levels = c("WHITE", "LATINE", "BLACK", "ASIAN", "OTHER", "UNKNOWN"))
+  )
+
+#Age
+df.overdose <- df.overdose %>%
+  mutate(
+    # Extract numeric values from the Age column
+    Age = str_extract(Age, "\\d+\\.?\\d*") %>%
+      as.numeric(),
+
+    # Replace unreasonably small values with NA (e.g., months like "0.0353" or erroneous entries)
+    Age = ifelse(Age < 1, 0, Age) )
+
+
+
+##Factor age groups
+df.overdose <- df.overdose %>% 
+  mutate(Age = as.numeric(Age)) %>%
+  mutate(Age.group = cut(Age, c(0, 1, 9, 19, 29, 39, 49, 59, 69, Inf), 
+                                 c("0", "1-9 years", "10-19 years", "20-29 years", "30-39 years", 
+                                   "40-49 years", "50-59 years", "60-69 years", "≥70 years"), 
+                                 include.lowest=TRUE))
+df.overdose <- df.overdose %>%
+  mutate(Age.cut = ifelse(Age <40, "<40 years", "≥40 years"))
+
+df.overdose <- df.overdose %>%
+  mutate(Year = year(`Date of Death`))
+
+##Code polysubstance
+df.overdose <- df.overdose %>%
+  select(ID, Age, Age.group, Age.cut, Gender, Race, Methamphetamine:`Any Drugs`, `Date of Death`, Year) %>%
+  mutate(Number.substance = rowSums(across(c(Heroin, Fentanyl, 
+                                           `Prescription.opioids`, Methamphetamine, 
+                                           Cocaine, Benzodiazepines))),
+         Polysubstance = ifelse(Number.substance > 1, 1, 0), 
+  `Fentanyl Present` = ifelse(Fentanyl == 1, 1, 0))
+
+
+
+
+```
+
+```{r Individual descriptives}
+df.overdose.long <-  df.overdose %>%
+  dplyr::select(`ID`, `Age`, Age.group, Race, Polysubstance, Number.substance, `Fentanyl Present`,
+                "Year","Heroin", 
+                "Fentanyl", "Prescription.opioids", 
+                "Methamphetamine", "Cocaine", "Benzodiazepines") %>%
+  pivot_longer(
+    cols = c("Heroin", "Fentanyl", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines"),
+    names_to = "Substance",
+    values_to = "Value") %>%   
+  mutate(Substance = factor(Substance, levels = 
+            c("Fentanyl", "Heroin", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines"))) %>%
+  mutate(Year = as.factor(Year))
+
+#Create table
+tbl.descriptive <- df.overdose.long %>% filter(Value == 1) %>%
+  select(-Value, -`ID`) %>%
+  mutate(Substance = recode(Substance, "Prescription.opioids" = "Prescription Opioids")) %>%
+  labelled::set_variable_labels(
+    # change all variable labels to "Title Case"
+    .labels = snakecase::to_title_case(names(.))) %>%
+  tbl_summary(by = Substance) %>%
+  add_p() %>%
+  add_overall()
+tbl.descriptive
+
+tbl.descriptive %>%
+  as_flex_table() %>%
+  save_as_docx(path = "Output/Table_1.docx",
+               pr_section = prop_section(
+                 page_size = page_size(orient = "landscape")
+               ))
+
+```
+
+```{r Plots}
+ggplot(data = df.overdose.long %>% filter(Value == 1), aes(x = Substance, y = Age, fill = Substance, color = Substance)) +
+  geom_bar(stat = "summary", fun.y = "mean") +
+  #geom_pointrange(stat = "summary", fun.ymin = min, fun.ymax = max, fun.y = median) +
+  scale_color_discrete_qualitative(palette = "Dark 2") +
+  scale_fill_discrete_qualitative(palette = "Dark 2") +
+  scale_y_continuous(limits = c(0, 50)) +
+  theme_minimal() +
+  guides(x = guide_axis(check.overlap = TRUE, angle = 45)) 
+
+ggplot(data = df.overdose.long %>% 
+         filter(Value == 1) %>%
+         filter(!Race %in% c("Other", "Unknown")), aes(x = Race, fill = Substance, color = Substance)) +
+  geom_bar(position = "fill") +
+  #geom_pointrange(stat = "summary", fun.ymin = min, fun.ymax = max, fun.y = median) +
+  scale_color_lancet() +
+  scale_fill_lancet() +
+  #scale_y_continuous(limits = c(0, 50)) +
+  theme_minimal() +
+  labs(y = "Proportion", x = "Race or Ethnicity") +
+  guides(x = guide_axis(check.overlap = TRUE, angle = 45)) 
+
+```
+
+#Invidivual level descriptives
+
+```{r Age}
+#Pivot to long format
+df.overdose.age <- df.overdose %>%
+  dplyr::select(ID, `Age`, "Year", "Any Opioids", "Heroin", 
+                "Fentanyl", "Prescription.opioids", 
+                "Methamphetamine", "Cocaine", "Benzodiazepines") %>%
+  pivot_longer(
+    cols = c("Any Opioids", "Heroin", "Fentanyl", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines"),
+    names_to = "Substance",
+    values_to = "Value"
+  ) %>%
+  filter(Value == 1) %>%
+  left_join(df.overdose %>% dplyr::select(ID, Fentanyl), by = "ID") %>%
+  mutate(Fentanyl = ifelse(Fentanyl == 1, "Present", "Absent")) %>%
+  mutate(Indicator = 1)
+
+#Order factors
+df.overdose.age <- df.overdose.age %>%
+  mutate(Substance = fct_rev(factor(Substance, levels = 
+            c("Any.Opioids", "Fentanyl", "Heroin", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines")))) 
+
+#Plot
+ggplot(data = df.overdose.age, aes(x = Age, y = Substance)) +
+  geom_density_ridges(fill = "light grey", alpha = 1) +
+  scale_x_continuous(limits = c(10,80)) +
+  labs(title = "Age distribution of overdose deaths by substance involved",
+       subtitle = "Los Angeles 2012-2024") +
+  theme_minimal()
+
+ggplot(data = df.overdose.age %>%
+         mutate(fct = ifelse(Year < 2017, "2012-2016", "2017-2024")), 
+       aes(x = Age, y = Substance)) +
+  geom_density_ridges(fill = "light grey", alpha = 1) +
+  scale_x_continuous(limits = c(10,80)) +
+  labs(title = "Age distribution of overdose deaths by substance involved",
+       subtitle = "Los Angeles 2012-2024") +
+  facet_wrap(~fct, nrow = 1) +
+  theme_minimal()
+
+ggplot(data = df.overdose.age %>% filter(Age > 10 & Age < 80),
+       aes(x = Substance, y = Age)) + 
+  geom_violin() +
+  ggforce::geom_sina(aes(color = Fentanyl, group = Substance), 
+                       size = .1, alpha = 0.8) +
+    #labs(title = .x) +
+    scale_color_discrete_qualitative() +
+  theme_minimal() +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+    guides(x = guide_axis(check.overlap = TRUE, angle = 45))
+```
+
+
+
+```{r Age density}
+#Density
+ggplot(df.overdose %>% 
+         mutate(Fentanyl = ifelse(Fentanyl == 1, "Present", "Absent")),
+         aes(x = Age, color = Fentanyl, fill = Fentanyl, group = Fentanyl)) + 
+  geom_density(alpha = 0.5) +
+  scale_fill_lancet() +
+  scale_color_lancet() +
+  theme_minimal()
+
+ggplot(df.overdose %>% 
+         mutate(Fentanyl = ifelse(Fentanyl == 1, "Present", "Absent")),
+         aes(x = Age, color = Fentanyl, fill = Fentanyl, group = Fentanyl)) + 
+  geom_density(alpha = 0.5) +
+  scale_fill_lancet() +
+  scale_color_lancet() +
+  theme_minimal() +
+  facet_wrap(~Year)
+
+
+#Raincloud
+ggplot(df.overdose, aes(x = Year, y = Age))  +
+    stat_interval(.width = c(.1, .25, .5, .75, 1), 
+                   height = 5, show.legend = F) +
+    rcartocolor::scale_color_carto_d(palette = "Peach") + 
+    stat_halfeye(aes(x = Year + 0.06, y = Age), 
+                  .width = 0, fill = "tan", alpha = 0.2, height = 0.7, 
+                  size = 0.7, point_alpha = 1, point_color = "#590000") +
+    scale_x_continuous(expand = c(0, 0.5)) +
+    scale_y_continuous(expand = c(0, 0)) + 
+    labs(x = "", y = "") +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          panel.grid.major.y = element_line(size = 0.1),
+          axis.text.x = element_text(size = 11, face = "bold"),
+          axis.text.y = element_text(size = 9, color = "grey65"))
+```
+
+```{r Race}
+df.overdose.race <- df.overdose %>%
+  dplyr::select(ID, `Age`, Age.cut, Race, "Year", "Heroin", 
+                "Fentanyl", "Prescription.opioids", 
+                "Methamphetamine", "Cocaine", "Benzodiazepines") %>%
+  pivot_longer(
+    cols = c("Heroin", "Fentanyl", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines"),
+    names_to = "Substance",
+    values_to = "Value"
+  ) %>%
+  filter(Value == 1) %>%
+  mutate(Substance = factor(Substance, levels = 
+            c("Fentanyl", "Heroin", 
+             "Prescription.opioids", "Methamphetamine", 
+             "Cocaine", "Benzodiazepines"))) %>%
+  mutate(Substance = recode(Substance, "Prescription.opioids" = "Prescription\nopioids")) %>%
+  left_join(df.overdose %>% dplyr::select(ID, Fentanyl), by = "ID") %>%
+  mutate(Fentanyl = ifelse(Fentanyl == 1, "Present", "Absent")) %>%
+  mutate(Indicator = 1)
+
+#Ridge plot by race/age/substance
+ggplot(data = df.overdose.race, aes(x = Age, y = Substance)) +
+  geom_density_ridges(fill = "light grey", alpha = 1) +
+  scale_x_continuous(limits = c(10,80)) +
+  labs(title = "Age distribution of overdose deaths by race and substance involved",
+       subtitle = "Los Angeles 2012-2021") +
+  facet_wrap(~ Race, nrow = 1) +
+  theme_minimal()
+
+ggplot(data = df.overdose.race %>% 
+         mutate(Race = str_to_sentence(Race)) %>%
+         
+         filter(Race %in% c("Black", "Latine", "White", "Asian")),
+       aes(x = Age, y = Substance)) +
+  geom_density_ridges(fill = "light grey", alpha = 1) +
+  scale_x_continuous(limits = c(10,80)) +
+  labs(title = "Age distribution of overdose deaths by race and substance involved",
+       subtitle = "Los Angeles 2012-2021") +
+  facet_wrap(~ Race, nrow = 1) +
+  theme_minimal()
+
+#Violin plot
+ggplot(data = df.overdose.race %>% 
+                  mutate(Race = str_to_sentence(Race)) %>%
+         filter(Race %in% c("Black", "Latine", "White", "Asian")),
+       aes(y = Age, x = Substance)) +
+  geom_violin(alpha = 1, trim = T, scale = "area") +
+  ggforce::geom_sina(aes(color = Fentanyl, group = Substance), 
+                       size = .1, alpha = 0.5) +
+  scale_color_lancet() +
+  labs(title = "Age distribution of overdose deaths by race and substance involved",
+       subtitle = "Los Angeles 2012-2024") +
+  facet_wrap(~ Race, ncol = 1,  strip.position = "right") +
+  theme_minimal()  +
+  guides(colour = guide_legend(override.aes = list(size=2)))
+ggsave("Output/race_age_substance_violin.png", dpi = 300, height = 8, width = 10,
+       bg = "white")
+
+#Raincloud
+p.raincloud <- ggplot(data = df.overdose.race %>% 
+                                 mutate(Race = str_to_sentence(Race)) %>%
+         filter(Race %in% c("Black", "Latine", "White", "Asian")),
+       aes(y = Age, x = Substance))  + 
+  ggdist::stat_halfeye(fill = "blue", alpha = 0.5,
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.3, 
+    point_colour = NA) + 
+  geom_boxplot(
+    width = .25, 
+    outlier.shape = NA
+  ) +
+  geom_point(aes(color = Fentanyl),
+    size = 0.1,
+    alpha = .3,
+    position = position_jitter(
+      seed = 1, width = .1
+    )
+  ) + 
+  scale_y_continuous(limits = c(0,80)) +
+  scale_x_discrete(position = "top") +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  scale_color_lancet() +
+  scale_fill_lancet() +
+  labs(title = "Age distribution of overdose deaths by race and substance involved",
+       subtitle = "Los Angeles 2012-2024") +
+  facet_wrap(~ Race, ncol = 1,   strip.position = "right") +
+  labs(x = "", y = "Age") +
+  theme_minimal()  +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  theme(panel.spacing.y = unit(0, "lines"))
+suppressWarnings(print(p.raincloud))
+ggsave("Output/race_age_substance_raincloud.png", dpi = 300, height = 8, width = 10,
+       bg = "white")
+
+df.overdose.race %>% 
+           mutate(Race = str_to_sentence(Race)) %>%
+         filter(Race %in% c("Black", "Latine", "White", "Asian")) %>%
+           filter(Year %in% c(2017:2024))
+
+p.raincloud.year <- map(c("2012-2016", "2017-2024"), ~ 
+      ggplot(data = df.overdose.race %>% 
+                        mutate(Race = str_to_sentence(Race)) %>%
+         filter(Race %in% c("Black", "Latine", "White", "Asian")) %>%
+           mutate(fct = ifelse(Year < 2017, "2012-2016", "2017-2024")) %>% 
+           filter(fct == .x),
+       aes(y = Age, x = Substance))  + 
+  ggdist::stat_halfeye(fill = "blue", alpha = 0.5,
+    adjust = .5, 
+    width = .6, 
+    .width = 0, 
+    justification = -.3, 
+    point_colour = NA) + 
+  geom_boxplot(
+    width = .25, 
+    outlier.shape = NA
+  ) +
+  geom_point(aes(color = Fentanyl),
+    size = 0.1,
+    alpha = .3,
+    position = position_jitter(
+      seed = 1, width = .1
+    )
+  ) + 
+  scale_y_continuous(limits = c(0,80)) +
+  scale_x_discrete(position = "top") +
+  coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+  scale_color_lancet() +
+  scale_fill_lancet( ) +
+  labs(title = "Age distribution of overdose deaths by race and substance involved",
+       subtitle = paste("Los Angeles", .x)) +
+  facet_wrap(~ Race, ncol = 1,   strip.position = "right") +
+  labs(x = "", y = "Age") +
+  theme_minimal()  +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  theme(panel.spacing.y = unit(0, "lines"))
+  )
+suppressWarnings(print(p.raincloud.year))
+ggsave("Output/race_age_substance_raincloud_year.png", dpi = 300, height = 8, width = 10,
+       bg = "white")
+
+```
+
+
+
